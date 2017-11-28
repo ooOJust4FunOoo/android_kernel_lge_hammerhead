@@ -16,12 +16,13 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
-
+#include <linux/ctype.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/mutex.h>
 #include <linux/delay.h>
 #include <linux/input.h>
 #include <linux/firmware.h>
@@ -262,6 +263,7 @@ struct synaptics_rmi4_fwu_handle {
 	bool initialized;
 	bool force_update;
 	char product_id[SYNAPTICS_RMI4_PRODUCT_ID_SIZE + 1];
+	unsigned int full_update_size;
 	unsigned int image_size;
 	unsigned int data_pos;
 	unsigned char intr_mask;
@@ -293,6 +295,7 @@ struct synaptics_rmi4_fwu_handle {
 	char *firmware_name;
 };
 
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_EXTRA_SYSFS
 static struct bin_attribute dev_attr_data = {
 	.attr = {
 		.name = "data",
@@ -302,8 +305,10 @@ static struct bin_attribute dev_attr_data = {
 	.read = fwu_sysfs_show_image,
 	.write = fwu_sysfs_store_image,
 };
+#endif
 
 static struct device_attribute attrs[] = {
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_EXTRA_SYSFS
 	__ATTR(forceflash, S_IWUGO,
 			synaptics_rmi4_show_error,
 			fwu_sysfs_force_reflash_store),
@@ -343,11 +348,29 @@ static struct device_attribute attrs[] = {
 	__ATTR(config_id, S_IRUGO,
 			fwu_sysfs_config_id_show,
 			synaptics_rmi4_store_error),
+#endif
 };
 
 static struct synaptics_rmi4_fwu_handle *fwu;
 
 static struct completion remove_complete;
+DEFINE_MUTEX(fwu_sysfs_mutex);
+
+/* Check offset + size <= bound.  1 if in bounds, 0 otherwise. */
+static bool in_bounds(unsigned long offset,
+		      unsigned long size,
+		      unsigned long bound)
+{
+	if (offset > bound || size > bound) {
+		pr_err("%s: %lu or %lu > %lu\n", __func__, offset, size, bound);
+		return 0;
+	}
+	if (offset > (bound - size)) {
+		pr_err("%s: %lu > %lu - %lu\n", __func__, offset, size, bound);
+		return 0;
+	}
+	return 1;
+}
 
 static unsigned int extract_uint(const unsigned char *ptr)
 {
@@ -365,10 +388,16 @@ static unsigned int extract_uint_be(const unsigned char *ptr)
 			(unsigned int)ptr[0] * 0x1000000;
 }
 
-static void parse_header(struct image_header *header,
+static int parse_header(struct image_header *header,
 		const unsigned char *fw_image)
 {
 	struct image_header_data *data = (struct image_header_data *)fw_image;
+	if (fwu->full_update_size < sizeof(*data)) {
+		dev_err(&fwu->rmi4_data->i2c_client->dev,
+			"Provided update too small");
+		return -EINVAL;
+	}
+
 	header->checksum = extract_uint(data->file_checksum);
 	header->bootloader_version = data->bootloader_version;
 	header->image_size = extract_uint(data->firmware_size);
@@ -394,7 +423,7 @@ static void parse_header(struct image_header *header,
 		header->image_size,
 		header->config_size);
 #endif
-	return;
+	return 0;
 }
 
 static int fwu_read_f01_device_status(struct f01_device_status *status)
@@ -606,7 +635,6 @@ static int fwu_wait_for_idle(int timeout_ms)
 static enum flash_area fwu_go_nogo(struct image_header *header)
 {
 	int retval = 0;
-	int index = 0;
 	int deviceFirmwareID;
 	int imageConfigID;
 	int deviceConfigID;
@@ -660,6 +688,8 @@ static enum flash_area fwu_go_nogo(struct image_header *header)
 			__func__);
 		imageFirmwareID = header->firmware_id;
 	} else {
+		size_t index, max_index;
+
 		strptr = strnstr(fwu->firmware_name, "PR",
 				sizeof(fwu->firmware_name));
 		if (!strptr) {
@@ -669,8 +699,11 @@ static enum flash_area fwu_go_nogo(struct image_header *header)
 			goto exit;
 		}
 
+		max_index = min((ptrdiff_t)(MAX_FIRMWARE_ID_LEN - 1),
+				&fwu->firmware_name[NAME_BUFFER_SIZE] - strptr);
+		index = 0;
 		strptr += 2;
-		while (strptr[index] >= '0' && strptr[index] <= '9') {
+		while (index < max_index && isdigit(strptr[index])) {
 			imagePR[index] = strptr[index];
 			index++;
 		}
@@ -1133,6 +1166,7 @@ write_config:
 	return retval;
 }
 
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_EXTRA_SYSFS
 static int fwu_start_write_config(void)
 {
 	int retval;
@@ -1290,6 +1324,7 @@ exit:
 
 	return retval;
 }
+#endif
 
 static int fwu_start_reflash(void)
 {
@@ -1345,13 +1380,33 @@ static int fwu_start_reflash(void)
 				__func__, fw_entry->size);
 
 		fw_image = fw_entry->data;
+		fwu->full_update_size = fw_entry->size;
 	}
 
-	parse_header(&header, fw_image);
+	if (parse_header(&header, fw_image)) {
+		retval = -EINVAL;
+		goto exit;
+	}
 
-	if (header.image_size)
+	if (header.image_size) {
+		if (!in_bounds(FW_IMAGE_OFFSET, header.image_size,
+			       fwu->full_update_size)) {
+			dev_err(&fwu->rmi4_data->i2c_client->dev,
+				"%s: image size out of bounds\n",
+				__func__);
+			return -EINVAL;
+		}
 		fwu->firmware_data = fw_image + FW_IMAGE_OFFSET;
+	}
 	if (header.config_size) {
+		// FW_IMAGE_OFFSET + image_size was ok as above
+		if (!in_bounds(FW_IMAGE_OFFSET + header.image_size,
+			       header.config_size, fwu->full_update_size)) {
+			dev_err(&fwu->rmi4_data->i2c_client->dev,
+				"%s: config size out of bounds\n",
+				__func__);
+			return -EINVAL;
+		}
 		fwu->config_data = fw_image + FW_IMAGE_OFFSET +
 				header.image_size;
 	}
@@ -1437,35 +1492,58 @@ int synaptics_fw_updater(unsigned char *fw_data)
 }
 EXPORT_SYMBOL(synaptics_fw_updater);
 
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_EXTRA_SYSFS
 static ssize_t fwu_sysfs_show_image(struct file *data_file,
 		struct kobject *kobj, struct bin_attribute *attributes,
 		char *buf, loff_t pos, size_t count)
 {
 	struct synaptics_rmi4_data *rmi4_data = fwu->rmi4_data;
+	ssize_t retval;
+
+	if (!mutex_trylock(&fwu_sysfs_mutex))
+		return -EBUSY;
 
 	if (count < fwu->config_size) {
 		dev_err(&rmi4_data->i2c_client->dev,
 				"%s: Not enough space (%d bytes) in buffer\n",
 				__func__, count);
-		return -EINVAL;
+		retval = -EINVAL;
+		goto show_image_exit;
 	}
 
 	memcpy(buf, fwu->read_config_buf, fwu->config_size);
-
-	return fwu->config_size;
+	retval = fwu->config_size;
+show_image_exit:
+	mutex_unlock(&fwu_sysfs_mutex);
+	return retval;
 }
 
 static ssize_t fwu_sysfs_store_image(struct file *data_file,
 		struct kobject *kobj, struct bin_attribute *attributes,
 		char *buf, loff_t pos, size_t count)
 {
+	ssize_t retval;
+	if (!mutex_trylock(&fwu_sysfs_mutex))
+		return -EBUSY;
+
+	if (count > fwu->image_size - fwu->data_pos) {
+		dev_err(&fwu->rmi4_data->i2c_client->dev,
+				"%s: Not enough space in buffer\n",
+				__func__);
+		retval = -EINVAL;
+		goto store_image_exit;
+	}
+
 	memcpy((void *)(&fwu->ext_data_source[fwu->data_pos]),
 			(const void *)buf,
 			count);
 
 	fwu->data_pos += count;
+	retval = count;
 
-	return count;
+store_image_exit:
+	mutex_unlock(&fwu_sysfs_mutex);
+	return retval;
 }
 
 static ssize_t fwu_sysfs_force_reflash_store(struct device *dev,
@@ -1475,14 +1553,17 @@ static ssize_t fwu_sysfs_force_reflash_store(struct device *dev,
 	unsigned int input;
 	struct synaptics_rmi4_data *rmi4_data = fwu->rmi4_data;
 
+	if (!mutex_trylock(&fwu_sysfs_mutex))
+		return -EBUSY;
+
 	if (sscanf(buf, "%u", &input) != 1) {
 		retval = -EINVAL;
-		goto exit;
+		goto force_reflash_store_exit;
 	}
 
 	if (input != 1) {
 		retval = -EINVAL;
-		goto exit;
+		goto force_reflash_store_exit;
 	}
 
 	fwu->force_update = true;
@@ -1491,14 +1572,16 @@ static ssize_t fwu_sysfs_force_reflash_store(struct device *dev,
 		dev_err(&rmi4_data->i2c_client->dev,
 				"%s: Failed to do reflash\n",
 				__func__);
-		goto exit;
+		goto force_reflash_store_free_exit;
 	}
 
 	retval = count;
 
-exit:
+force_reflash_store_free_exit:
 	kfree(fwu->ext_data_source);
 	fwu->ext_data_source = NULL;
+force_reflash_store_exit:
+	mutex_unlock(&fwu_sysfs_mutex);
 	return retval;
 }
 
@@ -1509,14 +1592,17 @@ static ssize_t fwu_sysfs_do_reflash_store(struct device *dev,
 	unsigned int input;
 	struct synaptics_rmi4_data *rmi4_data = fwu->rmi4_data;
 
+	if (!mutex_trylock(&fwu_sysfs_mutex))
+		return -EBUSY;
+
 	if (sscanf(buf, "%u", &input) != 1) {
 		retval = -EINVAL;
-		goto exit;
+		goto reflash_store_exit;
 	}
 
 	if (input != 1) {
 		retval = -EINVAL;
-		goto exit;
+		goto reflash_store_exit;
 	}
 
 	retval = synaptics_fw_updater(fwu->ext_data_source);
@@ -1524,14 +1610,16 @@ static ssize_t fwu_sysfs_do_reflash_store(struct device *dev,
 		dev_err(&rmi4_data->i2c_client->dev,
 				"%s: Failed to do reflash\n",
 				__func__);
-		goto exit;
+		goto reflash_store_free_exit;
 	}
 
 	retval = count;
 
-exit:
+reflash_store_free_exit:
 	kfree(fwu->ext_data_source);
 	fwu->ext_data_source = NULL;
+reflash_store_exit:
+	mutex_unlock(&fwu_sysfs_mutex);
 	return retval;
 }
 
@@ -1542,14 +1630,17 @@ static ssize_t fwu_sysfs_write_config_store(struct device *dev,
 	unsigned int input;
 	struct synaptics_rmi4_data *rmi4_data = fwu->rmi4_data;
 
+	if (!mutex_trylock(&fwu_sysfs_mutex))
+		return -EBUSY;
+
 	if (sscanf(buf, "%u", &input) != 1) {
 		retval = -EINVAL;
-		goto exit;
+		goto write_config_store_exit;
 	}
 
 	if (input != 1) {
 		retval = -EINVAL;
-		goto exit;
+		goto write_config_store_exit;
 	}
 
 	retval = fwu_start_write_config();
@@ -1557,14 +1648,16 @@ static ssize_t fwu_sysfs_write_config_store(struct device *dev,
 		dev_err(&rmi4_data->i2c_client->dev,
 				"%s: Failed to write config\n",
 				__func__);
-		goto exit;
+		goto write_config_store_free_exit;
 	}
 
 	retval = count;
 
-exit:
+write_config_store_free_exit:
 	kfree(fwu->ext_data_source);
 	fwu->ext_data_source = NULL;
+write_config_store_exit:
+	mutex_unlock(&fwu_sysfs_mutex);
 	return retval;
 }
 
@@ -1581,7 +1674,11 @@ static ssize_t fwu_sysfs_read_config_store(struct device *dev,
 	if (input != 1)
 		return -EINVAL;
 
+	if (!mutex_trylock(&fwu_sysfs_mutex))
+		return -EBUSY;
 	retval = fwu_do_read_config();
+	mutex_unlock(&fwu_sysfs_mutex);
+
 	if (retval < 0) {
 		dev_err(&rmi4_data->i2c_client->dev,
 				"%s: Failed to read config\n",
@@ -1602,7 +1699,10 @@ static ssize_t fwu_sysfs_config_area_store(struct device *dev,
 	if (retval)
 		return retval;
 
+	if (!mutex_trylock(&fwu_sysfs_mutex))
+		return -EBUSY;
 	fwu->config_area = config_area;
+	mutex_unlock(&fwu_sysfs_mutex);
 
 	return count;
 }
@@ -1613,11 +1713,14 @@ static ssize_t fwu_sysfs_image_size_store(struct device *dev,
 	int retval;
 	unsigned long size;
 	struct synaptics_rmi4_data *rmi4_data = fwu->rmi4_data;
+	if (!mutex_trylock(&fwu_sysfs_mutex))
+		return -EBUSY;
 
 	retval = kstrtoul(buf, 10, &size);
 	if (retval)
-		return retval;
+		goto image_size_store_exit;
 
+	fwu->full_update_size = size;
 	fwu->image_size = size;
 	fwu->data_pos = 0;
 
@@ -1627,10 +1730,12 @@ static ssize_t fwu_sysfs_image_size_store(struct device *dev,
 		dev_err(&rmi4_data->i2c_client->dev,
 				"%s: Failed to alloc mem for image data\n",
 				__func__);
-		return -ENOMEM;
+		retval = -ENOMEM;
 	}
 
-	return count;
+image_size_store_exit:
+	mutex_unlock(&fwu_sysfs_mutex);
+	return retval;
 }
 
 static ssize_t fwu_sysfs_block_size_show(struct device *dev,
@@ -1682,6 +1787,7 @@ static ssize_t fwu_sysfs_config_id_show(struct device *dev,
 	return snprintf(buf, PAGE_SIZE, "%d.%d.%d.%d\n",
 		config_id[0], config_id[1], config_id[2], config_id[3]);
 }
+#endif
 
 static void synaptics_rmi4_fwu_attn(struct synaptics_rmi4_data *rmi4_data,
 		unsigned char intr_mask)
@@ -1694,7 +1800,11 @@ static void synaptics_rmi4_fwu_attn(struct synaptics_rmi4_data *rmi4_data,
 
 static void synaptics_rmi4_fwu_work(struct work_struct *work)
 {
+	mutex_lock(&fwu_sysfs_mutex);
+
 	fwu_start_reflash();
+
+	mutex_unlock(&fwu_sysfs_mutex);
 }
 
 static int synaptics_rmi4_fwu_init(struct synaptics_rmi4_data *rmi4_data)
@@ -1765,6 +1875,15 @@ static int synaptics_rmi4_fwu_init(struct synaptics_rmi4_data *rmi4_data)
 	fwu->initialized = true;
 	fwu->force_update = FORCE_UPDATE;
 
+#ifdef INSIDE_FIRMWARE_UPDATE
+	fwu->fwu_workqueue = create_singlethread_workqueue("fwu_workqueue");
+	INIT_DELAYED_WORK(&fwu->fwu_work, synaptics_rmi4_fwu_work);
+	queue_delayed_work(fwu->fwu_workqueue,
+			&fwu->fwu_work,
+			msecs_to_jiffies(1000));
+#endif
+
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_EXTRA_SYSFS
 	retval = sysfs_create_bin_file(&rmi4_data->input_dev->dev.kobj,
 			&dev_attr_data);
 	if (retval < 0) {
@@ -1773,6 +1892,7 @@ static int synaptics_rmi4_fwu_init(struct synaptics_rmi4_data *rmi4_data)
 				__func__);
 		goto exit_free_mem;
 	}
+#endif
 
 	for (attr_count = 0; attr_count < ARRAY_SIZE(attrs); attr_count++) {
 		retval = sysfs_create_file(&rmi4_data->input_dev->dev.kobj,
@@ -1786,25 +1906,19 @@ static int synaptics_rmi4_fwu_init(struct synaptics_rmi4_data *rmi4_data)
 		}
 	}
 
-#ifdef INSIDE_FIRMWARE_UPDATE
-	fwu->fwu_workqueue = create_singlethread_workqueue("fwu_workqueue");
-	INIT_DELAYED_WORK(&fwu->fwu_work, synaptics_rmi4_fwu_work);
-	queue_delayed_work(fwu->fwu_workqueue,
-			&fwu->fwu_work,
-			msecs_to_jiffies(1000));
-#endif
-
 	init_completion(&remove_complete);
 
 	return 0;
 
 exit_remove_attrs:
-for (attr_count--; attr_count >= 0; attr_count--) {
-	sysfs_remove_file(&rmi4_data->input_dev->dev.kobj,
-			&attrs[attr_count].attr);
-}
+	for (attr_count--; attr_count >= 0; attr_count--) {
+		sysfs_remove_file(&rmi4_data->input_dev->dev.kobj,
+				&attrs[attr_count].attr);
+	}
 
-sysfs_remove_bin_file(&rmi4_data->input_dev->dev.kobj, &dev_attr_data);
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_EXTRA_SYSFS
+	sysfs_remove_bin_file(&rmi4_data->input_dev->dev.kobj, &dev_attr_data);
+#endif
 
 exit_free_mem:
 	kfree(fwu->fn_ptr);
@@ -1820,7 +1934,9 @@ static void synaptics_rmi4_fwu_remove(struct synaptics_rmi4_data *rmi4_data)
 {
 	unsigned char attr_count;
 
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_EXTRA_SYSFS
 	sysfs_remove_bin_file(&rmi4_data->input_dev->dev.kobj, &dev_attr_data);
+#endif
 
 	for (attr_count = 0; attr_count < ARRAY_SIZE(attrs); attr_count++) {
 		sysfs_remove_file(&rmi4_data->input_dev->dev.kobj,
